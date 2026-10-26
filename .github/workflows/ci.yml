@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Native moon CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
+          # Cache proto tools only, not Moon task state or reports.
+          cache: true
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check tracked dependency inputs
+        run: moon run root:deps-check
+
+      - name: Run native affected CI and dependency E2E
+        # Moon detects GitHub push/PR base and head revisions from the event.
+        run: moon ci --include-relations --downstream deep
+
+      - name: Upload current CI and dependency E2E reports
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .moon/cache/ciReport.json
+            .moon/cache/dependency-inputs-e2e.json
+          include-hidden-files: true
+          if-no-files-found: error

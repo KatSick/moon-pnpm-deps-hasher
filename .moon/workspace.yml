@@ -9,9 +9,13 @@ projects:
   colors: packages/colors
   palette: apps/palette
 
-# Native fingerprint checks provide precise resolved dependency closures.
+# Tracked importer dependency inputs preserve precise resolved closures.
 hasher:
   optimization: performance
 
 vcs:
   defaultBranch: main
+  hooks:
+    pre-commit:
+      - moon run root:deps-check -- --staged
+  sync: true

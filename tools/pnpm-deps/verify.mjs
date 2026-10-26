@@ -3,10 +3,12 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,7 +32,21 @@ const numberTargets = ["numbers:build", "reports:build", "dashboard:build"].sort
 const colorTargets = ["colors:build", "palette:build"].sort();
 const transitiveOverride = "is-odd@3>is-number";
 const transitiveOverrideRange = "^6.0.0 || ^7.0.0";
-const nativeOptions = ["--no-actions", "--output-style", "buffer-only-failure"];
+const projectTaskIds = ["build", "test", "lint", "format-check"];
+const allProjectTargets = Object.keys(projects)
+  .flatMap((project) => projectTaskIds.map((task) => `${project}:${task}`))
+  .sort();
+const rootTargets = [
+  "root:deps-update",
+  "root:deps-check",
+  "root:verify-deps",
+  "root:test-extension",
+  "root:typecheck",
+];
+const generatedPaths = [".", ...Object.values(projects)]
+  .map((importer) => join(importer, ".moon-deps.json"))
+  .sort();
+const nativeOptions = ["--output-style", "buffer-only-failure"];
 const isolatedInstallOptions = [
   "--ignore-scripts",
   "--prefer-offline",
@@ -42,28 +58,34 @@ const isolatedInstallOptions = [
 const cacheStatuses = new Set(["cached", "cached-from-remote"]);
 const environment = { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" };
 
-// Never inherit a caller's git/workspace overrides into the disposable repository.
-for (const key of [
-  "GIT_DIR",
-  "GIT_COMMON_DIR",
-  "GIT_WORK_TREE",
-  "GIT_INDEX_FILE",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "MOON_WORKSPACE_ROOT",
-  "MOON_PROJECT_ROOT",
-  "MOON_WORKING_DIR",
-  "MOON_CACHE_DIR",
-]) {
-  delete environment[key];
+// Keep every Git, moon, and CI operation inside the disposable fixture. In
+// particular, never inherit the caller's index, remote revisions, or hooks.
+for (const key of Object.keys(environment)) {
+  if (
+    /^(GIT_|MOON_|GITHUB_|GITLAB_|BUILDKITE_|CIRCLE_|TRAVIS_|BITBUCKET_|JENKINS_)/.test(key) ||
+    [
+      "CI",
+      "CONTINUOUS_INTEGRATION",
+      "BUILD_NUMBER",
+      "RUN_ID",
+      "TF_BUILD",
+      "TEAMCITY_VERSION",
+    ].includes(key)
+  ) {
+    delete environment[key];
+  }
 }
+environment.GIT_CONFIG_GLOBAL = "/dev/null";
+environment.GIT_CONFIG_SYSTEM = "/dev/null";
+environment.GIT_CONFIG_NOSYSTEM = "1";
 
-function command(root, executable, args, input) {
+function invoke(root, executable, args, { input, env = {} } = {}) {
   const result = spawnSync(executable, args, {
     cwd: root,
     env: {
       ...environment,
       PATH: `${join(root, "node_modules/.bin")}${delimiter}${environment.PATH ?? ""}`,
+      ...env,
     },
     input,
     encoding: "utf8",
@@ -71,13 +93,25 @@ function command(root, executable, args, input) {
     timeout: 300_000,
   });
 
-  if (result.error || result.status !== 0) {
+  if (result.error) {
+    throw new Error(`${executable} ${args.join(" ")} could not start: ${result.error.message}`);
+  }
+
+  return result;
+}
+
+function requireSuccess(result, executable, args) {
+  if (result.status !== 0) {
     throw new Error(
-      `${executable} ${args.join(" ")} failed${result.signal ? ` (${result.signal})` : ""}\n${result.error?.message ?? ""}\n${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+      `${executable} ${args.join(" ")} failed${result.signal ? ` (${result.signal})` : ""}\n${result.stdout ?? ""}\n${result.stderr ?? ""}`,
     );
   }
 
   return result.stdout;
+}
+
+function command(root, executable, args, options) {
+  return requireSuccess(invoke(root, executable, args, options), executable, args);
 }
 
 function copySources(root) {
@@ -89,7 +123,7 @@ function copySources(root) {
       const parts = relative(sourceRoot, source).split(sep);
       return (
         !parts.some((part) => [".git", ".sc", "node_modules", "dist"].includes(part)) &&
-        !(parts[0] === ".moon" && parts[1] === "cache")
+        !(parts[0] === ".moon" && ["cache", "hooks"].includes(parts[1]))
       );
     },
   });
@@ -269,68 +303,131 @@ function addLeafVersion(lock, name, oldReference, metadata) {
   return metadata.version;
 }
 
-// moon 2.6.4 schema: runReport.actions[].node is tagged as
-// {action: "run-task", params: {target: "project:task"}}. No task hash is
-// present in this report. Actual hashes are flat lastRun.json state fields at
-// .moon/cache/states/<project>/<task>/lastRun.json (simple IDs need no encoding).
-// Sources: moon v2.6.4 action_node.rs, reports_subscriber.rs, run_state.rs,
-// cache/src/state_engine.rs, and cache-item/src/cache_item.rs.
-function readRun(root) {
-  const path = join(root, ".moon/cache/runReport.json");
-  if (!existsSync(path)) {
-    // moon does not emit a report for an empty action graph. The caller removes
-    // the previous report first, and exact target assertions reject this for
-    // every non-empty expected run.
-    return { targets: [], run: [], cached: [], skipped: [], noActionGraph: true };
-  }
+// moon 2.6 uses the same action schema for ciReport.json and runReport.json.
+// Task hashes live separately in states/<project>/<task>/lastRun.json.
+function readReport(root, kind) {
+  const path = `.moon/cache/${kind}Report.json`;
+  const result = {
+    path,
+    actions: [],
+    tasks: [],
+    targets: [],
+    run: [],
+    cached: [],
+    skipped: [],
+    failed: [],
+  };
+  if (!existsSync(join(root, path))) return { ...result, noActionGraph: true };
 
-  const report = JSON.parse(readFileSync(path, "utf8"));
-  assert.equal(report.status, "completed", "Native moon pipeline did not complete");
-  assert.ok(Array.isArray(report.actions), "Unsupported moon run-report actions schema");
-  const result = { targets: [], run: [], cached: [], skipped: [] };
+  const report = JSON.parse(readFileSync(join(root, path), "utf8"));
+  assert.equal(typeof report.status, "string", "Unsupported moon pipeline-status schema");
+  assert.ok(Array.isArray(report.actions), "Unsupported moon action-report schema");
+  result.status = report.status;
   const seen = new Set();
 
   for (const action of report.actions) {
     if (action.node?.action !== "run-task") continue;
     const target = action.node.params?.target;
     assert.equal(typeof target, "string", "Unsupported moon task-target report schema");
-    assert.ok(allTargets.includes(target), `Unexpected native task ${target}`);
+    assert.ok(
+      allProjectTargets.includes(target) || rootTargets.includes(target),
+      `Unexpected native task ${target}`,
+    );
     assert.ok(!seen.has(target), `Duplicate native task ${target}`);
     seen.add(target);
+    result.actions.push({ target, status: action.status });
     if (action.status === "passed") result.run.push(target);
     else if (cacheStatuses.has(action.status)) result.cached.push(target);
     else if (action.status === "skipped") result.skipped.push(target);
-    else throw new Error(`${target} has unsuccessful native status ${action.status}`);
+    else result.failed.push(target);
   }
 
-  for (const field of ["run", "cached", "skipped"]) result[field].sort();
+  result.actions.sort((left, right) => left.target.localeCompare(right.target));
+  for (const field of ["run", "cached", "skipped", "failed"]) result[field].sort();
+  result.tasks = result.actions.map((action) => action.target).sort();
   result.targets = [...result.run, ...result.cached].sort();
   return result;
 }
 
-function executeMoon(root, executable, args, input) {
-  rmSync(join(root, ".moon/cache/runReport.json"), { force: true });
-  command(root, executable, args, input);
-  return readRun(root);
+function moon(root, args, options) {
+  const kind = args[0] === "ci" ? "ci" : "run";
+  rmSync(join(root, `.moon/cache/${kind}Report.json`), { force: true });
+  const result = invoke(root, "moon", args, options);
+  return {
+    command: ["moon", ...args],
+    exitCode: result.status,
+    signal: result.signal,
+    ...readReport(root, kind),
+    ...(result.status === 0 ? {} : { stdout: result.stdout, stderr: result.stderr }),
+  };
+}
+
+function assertSucceeded(result, label) {
+  assert.equal(
+    result.exitCode,
+    0,
+    `${label}: command failed\n${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+  );
+  if (!result.noActionGraph) {
+    assert.equal(result.status, "completed", `${label}: native pipeline did not complete`);
+  }
+  assert.deepEqual(result.failed, [], `${label}: native task failed`);
+}
+
+function assertRejected(result, label) {
+  assert.equal(typeof result.exitCode, "number", `${label}: command did not exit normally`);
+  assert.notEqual(result.exitCode, 0, `${label}: stale inputs were accepted`);
+  assert.equal(result.signal, null, `${label}: command was terminated instead of rejecting inputs`);
+}
+
+function job(root, id, passthrough = []) {
+  return moon(root, [
+    ...(id === "deps-update" ? ["exec", "--ci=false"] : ["run"]),
+    `root:${id}`,
+    ...nativeOptions,
+    "--no-actions",
+    ...(passthrough.length ? ["--", ...passthrough] : []),
+  ]);
 }
 
 function nativeBuild(root) {
-  return executeMoon(root, "moon", ["run", ...allTargets, ...nativeOptions]);
+  return moon(root, ["run", ...allTargets, ...nativeOptions, "--no-actions"]);
 }
 
-function adapter(root, dryRun) {
-  const args = [
-    join(root, "tools/pnpm-deps/cli.mjs"),
-    "affected",
-    "--base",
-    "HEAD",
-    ...(dryRun ? ["--dry-run"] : []),
-    "--",
-    ...allTargets,
-    ...nativeOptions,
-  ];
-  if (dryRun) return JSON.parse(command(root, process.execPath, args));
-  return executeMoon(root, process.execPath, args);
+function nativeCI(root, base, head, normalActions = false) {
+  return moon(
+    root,
+    [
+      "ci",
+      "--include-relations",
+      "--downstream",
+      "deep",
+      "--base",
+      base,
+      "--head",
+      head,
+      ...nativeOptions,
+      ...(normalActions ? [] : ["--no-actions"]),
+    ],
+    { env: { CI: "true" } },
+  );
+}
+
+function queryTasks(root, files) {
+  const args = ["query", "tasks", "--affected", "--downstream", "deep"];
+  const query = JSON.parse(
+    command(root, "moon", args, {
+      input: JSON.stringify({ files }),
+      env: { CI: "true" },
+    }),
+  );
+  assert.ok(query.tasks && typeof query.tasks === "object", "Unsupported native task-query schema");
+  const targets = [];
+  for (const [project, tasks] of Object.entries(query.tasks)) {
+    assert.ok(tasks && typeof tasks === "object", `Invalid queried tasks for ${project}`);
+    for (const id of Object.keys(tasks)) targets.push(`${project}:${id}`);
+  }
+  return { command: ["moon", ...args], files, targets: targets.sort() };
 }
 
 function hashes(root) {
@@ -349,9 +446,10 @@ function hashes(root) {
 }
 
 function assertCached(result, targets, label) {
-  assert.deepEqual(result.targets, targets, `${label}: native target selection differs`);
+  assertSucceeded(result, label);
+  assert.deepEqual(result.tasks, targets, `${label}: native task selection differs`);
   assert.deepEqual(result.run, [], `${label}: unexpected cache miss`);
-  assert.deepEqual(result.cached, targets, `${label}: every target must be cached`);
+  assert.deepEqual(result.cached, targets, `${label}: every task must be cached`);
 }
 
 function reversedKeys(value) {
@@ -367,124 +465,335 @@ function reversedKeys(value) {
   return value;
 }
 
-async function verify(root) {
-  copySources(root);
-
-  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-  const moonVersion = command(root, "moon", ["--version"]).trim();
-  const pnpmVersion = command(root, "pnpm", ["--version"]).trim();
-  assert.ok(
-    moonVersion.includes(manifest.devDependencies["@moonrepo/cli"]),
-    `Expected pinned moon, received ${moonVersion}`,
+function inputState(root, paths = ["pnpm-lock.yaml", ...generatedPaths]) {
+  return Object.fromEntries(
+    paths.map((path) => {
+      const absolute = join(root, path);
+      return [
+        path,
+        existsSync(absolute)
+          ? {
+              text: readFileSync(absolute, "utf8"),
+              modifiedNs: statSync(absolute, { bigint: true }).mtimeNs.toString(),
+            }
+          : null,
+      ];
+    }),
   );
+}
+
+function generatedContents(root) {
+  return Object.fromEntries(
+    generatedPaths.map((path) => [path, readFileSync(join(root, path), "utf8")]),
+  );
+}
+
+function rawDiff(root, base, head) {
+  return command(root, "git", ["diff", "--name-only", "-z", base, head, "--"])
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+}
+
+function commit(root, message, hooks = false) {
+  command(root, "git", [
+    ...(hooks ? [] : ["-c", "core.hooksPath=/dev/null"]),
+    "commit",
+    "-m",
+    message,
+  ]);
+  return command(root, "git", ["rev-parse", "HEAD"]).trim();
+}
+
+function disableRecursiveVerification(root) {
+  const path = join(root, "moon.yml");
+  const documents = parseAllDocuments(readFileSync(path, "utf8"));
+  assert.equal(documents.length, 1, "Expected one root moon configuration document");
+  const document = documents[0];
+  assert.equal(document.errors.length, 0, document.errors.map((error) => error.message).join("\n"));
+  const option = ["tasks", "verify-deps", "options", "runInCI"];
+  assert.equal(document.getIn(option), "always", "The real E2E job must be mandatory in CI");
   assert.equal(
-    pnpmVersion,
-    manifest.packageManager.slice("pnpm@".length),
-    "Expected pinned pnpm on PATH",
+    document.getIn(["tasks", "deps-check", "options", "runInCI"]),
+    "always",
+    "The fixture must retain the mandatory native checker",
   );
-  prepareTransitiveOverride(root);
-  install(root);
+  document.setIn(option, false);
+  writeFileSync(path, document.toString());
+}
 
+function changeTransitive(root, metadata) {
+  const lock = readLock(root);
+  const importerBefore = canonical(lock.project.importers);
+  const odd = dependency(lock.project.importers[projects.numbers], "is-odd").version;
+  const legacyOdd = dependency(
+    lock.project.importers[projects["legacy-numbers"]],
+    "is-odd",
+  ).version;
+  const oddSnapshot = snapshot(lock.project, "is-odd", odd).value;
+  const legacyReference = snapshot(lock.project, "is-odd", legacyOdd).value.dependencies[
+    "is-number"
+  ];
+  const before = oddSnapshot.dependencies["is-number"];
+  assert.equal(before, "6.0.0");
+  assert.equal(legacyReference, "4.0.0");
+  oddSnapshot.dependencies["is-number"] = addLeafVersion(
+    lock.project,
+    "is-number",
+    before,
+    metadata,
+  );
+  writeLock(root, lock);
+  assert.deepEqual(canonical(readLock(root).project.importers), importerBefore);
+  assert.equal(
+    snapshot(readLock(root).project, "is-odd", legacyOdd).value.dependencies["is-number"],
+    legacyReference,
+  );
+  return {
+    package: "is-number",
+    importer: projects.numbers,
+    via: "is-odd",
+    before,
+    after: metadata.version,
+    unchangedLegacyVersion: legacyReference,
+    generatedBy:
+      "registry metadata and lock snapshot edge update under stable scoped override, followed by frozen install",
+  };
+}
+
+function expectedTasks(buildTargets, { sourceOnly = false, tooling = false } = {}) {
+  const targets = buildTargets.flatMap((target) => {
+    const project = target.split(":")[0];
+    const ids = sourceOnly && project !== "numbers" ? ["build", "test"] : projectTaskIds;
+    return ids.map((id) => `${project}:${id}`);
+  });
+  targets.push("root:deps-check");
+  if (buildTargets.length) targets.push("root:typecheck");
+  if (tooling) targets.push("root:test-extension");
+  return targets.sort();
+}
+
+async function verify(root, evidence) {
+  copySources(root);
+  disableRecursiveVerification(root);
+  prepareTransitiveOverride(root);
   command(root, "git", ["init", "--initial-branch=main"]);
+  command(root, "git", ["config", "--local", "user.name", "Dependency scenario verifier"]);
+  command(root, "git", ["config", "--local", "user.email", "dependency-verifier@example.invalid"]);
+  command(root, "git", ["config", "--local", "commit.gpgSign", "false"]);
+  command(root, "git", [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "commit",
+    "--allow-empty",
+    "-m",
+    "Initialize disposable native moon history",
+  ]);
   assert.equal(
     realpathSync(command(root, "git", ["rev-parse", "--show-toplevel"]).trim()),
     realpathSync(root),
   );
-  command(root, "git", ["add", "--all"]);
-  command(root, "git", [
-    "-c",
-    "user.name=Dependency scenario verifier",
-    "-c",
-    "user.email=dependency-verifier@example.invalid",
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "commit.gpgSign=false",
-    "commit",
-    "--no-verify",
-    "-m",
-    "Disposable dependency verification baseline",
-  ]);
+  assert.equal(command(root, "git", ["rev-parse", "--is-shallow-repository"]).trim(), "false");
 
-  const sourceFile = "packages/numbers/src/index.ts";
-  const restoredFiles = [
-    "pnpm-lock.yaml",
-    "pnpm-workspace.yaml",
-    "package.json",
-    ...Object.values(projects).map((directory) => `${directory}/package.json`),
-    sourceFile,
-  ];
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  evidence.moonVersion = command(root, "moon", ["--version"]).trim();
+  evidence.pnpmVersion = command(root, "pnpm", ["--version"]).trim();
+  assert.ok(
+    evidence.moonVersion.includes(manifest.devDependencies["@moonrepo/cli"]),
+    `Expected pinned moon, received ${evidence.moonVersion}`,
+  );
+  assert.equal(
+    evidence.pnpmVersion,
+    manifest.packageManager.slice("pnpm@".length),
+    "Expected pinned pnpm on PATH",
+  );
+  evidence.scratchOverride = { [transitiveOverride]: transitiveOverrideRange };
+  install(root);
+
+  assert.deepEqual(
+    Object.keys(readLock(root).project.importers).sort(),
+    [".", ...Object.values(projects)].sort(),
+    "The fixture importer map differs from its project tasks",
+  );
+  for (const path of generatedPaths) rmSync(join(root, path), { force: true });
+  let beforeCheck = inputState(root);
+  evidence.checks.missing = job(root, "deps-check");
+  assertRejected(evidence.checks.missing, "Native missing-input check");
+  assert.deepEqual(inputState(root), beforeCheck, "The missing-input check wrote to its inputs");
+  evidence.checks.bootstrap = job(root, "deps-update");
+  assertSucceeded(evidence.checks.bootstrap, "Native snapshot bootstrap");
+  for (const importer of [".", ...Object.values(projects)]) {
+    const path = join(root, importer, ".moon-deps.json");
+    const text = readFileSync(path, "utf8");
+    const value = JSON.parse(text);
+    assert.equal(value.version, 1);
+    assert.equal(value.importer, importer);
+    assert.match(value.hash, /^[a-f0-9]{64}$/);
+    assert.equal(text, `${JSON.stringify(value, null, 2)}\n`, `Unstable generated JSON at ${path}`);
+  }
+  const freshContents = generatedContents(root);
+  const stalePath = join(root, projects.numbers, ".moon-deps.json");
+  const stale = JSON.parse(readFileSync(stalePath, "utf8"));
+  stale.hash = "0".repeat(64);
+  writeFileSync(stalePath, `${JSON.stringify(stale, null, 2)}\n`);
+  beforeCheck = inputState(root);
+  evidence.checks.stale = job(root, "deps-check");
+  assertRejected(evidence.checks.stale, "Native stale-input check");
+  assert.deepEqual(inputState(root), beforeCheck, "The stale-input check wrote to its inputs");
+  evidence.checks.repair = job(root, "deps-update");
+  assertSucceeded(evidence.checks.repair, "Native stale-input update");
+  assert.deepEqual(
+    generatedContents(root),
+    freshContents,
+    "Native update did not repair the snapshot",
+  );
+  beforeCheck = inputState(root);
+  evidence.checks.fresh = job(root, "deps-check");
+  assertSucceeded(evidence.checks.fresh, "Native fresh-input check");
+  assert.deepEqual(inputState(root), beforeCheck, "The fresh-input check wrote to its inputs");
+  evidence.checks.idempotent = job(root, "deps-update");
+  assertSucceeded(evidence.checks.idempotent, "Native unchanged-input update");
+  assert.deepEqual(
+    inputState(root),
+    beforeCheck,
+    "Native update rewrote unchanged generated bytes",
+  );
+
+  command(root, "moon", ["sync", "vcs-hooks"]);
+  const hook = resolve(
+    root,
+    command(root, "git", ["rev-parse", "--git-path", "hooks/pre-commit"]).trim(),
+  );
+  assert.ok(existsSync(hook), `Native pre-commit hook was not installed at ${hook}`);
+  const hookFromRoot = relative(realpathSync(root), realpathSync(hook));
+  assert.ok(
+    !isAbsolute(hookFromRoot) && hookFromRoot !== ".." && !hookFromRoot.startsWith(`..${sep}`),
+    "Native pre-commit hook resolves outside the disposable fixture",
+  );
+  command(root, "git", ["add", "--all"]);
+  const base = commit(root, "Disposable native dependency-input baseline");
   const baselineFiles = new Map(
-    restoredFiles.map((path) => [path, readFileSync(join(root, path))]),
+    [
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "package.json",
+      ...Object.values(projects).map((directory) => `${directory}/package.json`),
+      "packages/numbers/src/index.ts",
+    ].map((path) => [path, readFileSync(join(root, path))]),
   );
   const baselineLock = readLock(root);
   const baselineBoot = canonical(baselineLock.boot);
   const baselineProject = canonical(baselineLock.project);
+  const baselineContents = generatedContents(root);
   const baselineInstalled = {
     numbers: installedVersion(root, projects.numbers, "is-odd"),
     numbersTransitive: installedVersion(root, projects.numbers, "is-number", "is-odd"),
     legacy: installedVersion(root, projects["legacy-numbers"], "is-odd"),
     legacyTransitive: installedVersion(root, projects["legacy-numbers"], "is-number", "is-odd"),
   };
+  assert.equal(baselineInstalled.numbers, "3.0.1");
   assert.equal(baselineInstalled.numbersTransitive, "6.0.0");
   assert.equal(baselineInstalled.legacyTransitive, "4.0.0");
   const baselineRun = nativeBuild(root);
+  evidence.baseline = { base, installed: baselineInstalled, run: baselineRun };
+  assertSucceeded(baselineRun, "Native baseline builds");
   assert.deepEqual(
-    baselineRun.targets,
+    baselineRun.run,
     allTargets,
-    "Fresh native baseline did not select all six builds",
+    "Fresh scratch baseline must execute all six builds",
   );
-  assert.deepEqual(baselineRun.run, allTargets, "Fresh scratch baseline must execute real builds");
   const baselineHashes = hashes(root);
+  evidence.baseline.hashes = baselineHashes;
   const baselineCached = nativeBuild(root);
-  assertCached(baselineCached, allTargets, "Second baseline run");
+  evidence.baseline.warm = baselineCached;
+  assertCached(baselineCached, allTargets, "Second native baseline run");
   assert.deepEqual(hashes(root), baselineHashes, "Repeated baseline changed native hashes");
-  const toolingTargets = [":test", "root:test-extension", ":lint", ":format-check"];
-  command(root, "moon", ["run", ...toolingTargets, ...nativeOptions]);
-  const evidence = {
-    moonVersion,
-    pnpmVersion,
-    scratchOverride: { [transitiveOverride]: transitiveOverrideRange },
-    toolingTargets,
-    baseline: {
-      run: baselineRun.run,
-      cached: baselineCached.cached,
-      hashes: baselineHashes,
-      installed: baselineInstalled,
-    },
-    scenarios: [],
+
+  const transitiveMetadata = await registryPackage("is-number", "7.0.0");
+  command(root, "git", ["switch", "--create", "verify-staged-hook", base]);
+  changeTransitive(root, transitiveMetadata);
+  command(root, "git", ["add", "--", "pnpm-lock.yaml"]);
+  const stagedBefore = command(root, "git", ["show", `:${projects.numbers}/.moon-deps.json`]);
+  evidence.hook = { path: hookFromRoot, freshWorktree: job(root, "deps-update") };
+  assertSucceeded(evidence.hook.freshWorktree, "Fresh worktree update before staged hook");
+  assert.equal(
+    command(root, "git", ["show", `:${projects.numbers}/.moon-deps.json`]),
+    stagedBefore,
+    "Native update unexpectedly staged generated inputs",
+  );
+  assert.notEqual(
+    readFileSync(join(root, projects.numbers, ".moon-deps.json"), "utf8"),
+    stagedBefore,
+    "Hook fixture needs fresh unstaged generated inputs",
+  );
+  evidence.hook.worktreeCheck = job(root, "deps-check");
+  assertSucceeded(evidence.hook.worktreeCheck, "Fresh unstaged worktree check");
+  evidence.hook.stagedCheck = job(root, "deps-check", ["--staged"]);
+  assertRejected(evidence.hook.stagedCheck, "Stale index with a fresh worktree");
+  const rejectedHook = invoke(root, hook, []);
+  evidence.hook.rejected = {
+    exitCode: rejectedHook.status,
+    signal: rejectedHook.signal,
+    stdout: rejectedHook.stdout,
+    stderr: rejectedHook.stderr,
   };
+  assertRejected(evidence.hook.rejected, "Installed native pre-commit hook");
+  command(root, "git", ["add", "--", "pnpm-lock.yaml", ...generatedPaths]);
+  evidence.hook.consistentStage = job(root, "deps-check", ["--staged"]);
+  assertSucceeded(evidence.hook.consistentStage, "Consistent staged inputs");
+  evidence.hook.commit = commit(root, "Exercise the actual native pre-commit hook", true);
+  assert.equal(command(root, "git", ["rev-parse", "HEAD^"]).trim(), base);
 
-  function restore() {
-    for (const [path, bytes] of baselineFiles) writeFileSync(join(root, path), bytes);
-  }
+  command(root, "git", ["switch", "--create", "verify-mandatory-native-ci", base]);
+  changeTransitive(root, transitiveMetadata);
+  command(root, "git", ["add", "--", "pnpm-lock.yaml"]);
+  const staleHead = commit(root, "Intentionally stale dependency inputs for native CI rejection");
+  const staleFiles = rawDiff(root, base, staleHead);
+  assert.deepEqual(staleFiles, ["pnpm-lock.yaml"]);
+  evidence.mandatoryCI = {
+    files: staleFiles,
+    query: queryTasks(root, staleFiles),
+  };
+  assert.deepEqual(
+    evidence.mandatoryCI.query.targets,
+    ["root:deps-check"],
+    "Stale lock-only fixture must omit every project task before native CI",
+  );
+  rmSync(join(root, ".moon/cache"), { recursive: true, force: true });
+  evidence.mandatoryCI.ci = nativeCI(root, base, staleHead);
+  assertRejected(evidence.mandatoryCI.ci, "Mandatory native CI freshness check");
+  assert.deepEqual(
+    evidence.mandatoryCI.ci.tasks,
+    ["root:deps-check"],
+    "Stale native CI unexpectedly selected project tasks",
+  );
+  assert.deepEqual(evidence.mandatoryCI.ci.failed, ["root:deps-check"]);
 
-  async function scenario(
-    name,
-    expectedTargets,
-    mutate,
-    { sourceOnly = false, control = false } = {},
-  ) {
-    restore();
+  const sourceFile = "packages/numbers/src/index.ts";
+  async function scenario(name, buildTargets, mutate, options = {}) {
+    command(root, "git", ["switch", "--create", `verify-${name}`, base]);
     install(root);
     const restored = nativeBuild(root);
-    assertCached(restored, allTargets, `${name}: restored baseline`);
+    assertSucceeded(restored, `${name}: restored baseline builds`);
     assert.deepEqual(hashes(root), baselineHashes, `${name}: restored baseline hashes differ`);
-    const mutation = await mutate();
+    const entry = { scenario: name };
+    evidence.scenarios.push(entry);
+    entry.mutation = await mutate();
     assert.deepEqual(
       canonical(readLock(root).boot),
       baselineBoot,
       `${name}: modified pnpm boot documents`,
     );
     install(root);
-    let installed;
-    if (mutation?.package) {
-      installed = installedVersion(root, mutation.importer, mutation.package, mutation.via);
-      assert.equal(
-        installed,
-        mutation.after,
-        `${name}: installed dependency does not match the changed lockfile`,
+    if (entry.mutation.package) {
+      const mutation = entry.mutation;
+      entry.installedVersion = installedVersion(
+        root,
+        mutation.importer,
+        mutation.package,
+        mutation.via,
       );
+      assert.equal(entry.installedVersion, mutation.after, `${name}: wrong installed dependency`);
       if (mutation.unchangedLegacyVersion) {
         assert.equal(
           installedVersion(root, projects["legacy-numbers"], "is-number", "is-odd"),
@@ -493,120 +802,93 @@ async function verify(root) {
         );
       }
     }
-    const projection = adapter(root, true);
-    assert.ok(
-      Array.isArray(projection.files) && Array.isArray(projection.dependencyImporters),
-      `${name}: invalid adapter dry-run JSON`,
-    );
-    if (sourceOnly) {
-      assert.deepEqual(
-        projection.dependencyImporters,
-        [],
-        `${name}: source edit must not claim a dependency change`,
-      );
-      assert.deepEqual(
-        projection.files,
-        [sourceFile],
-        `${name}: source path was not forwarded unchanged`,
-      );
-    } else if (expectedTargets.length === 0) {
-      assert.deepEqual(
-        projection,
-        { files: [], dependencyImporters: [] },
-        `${name}: semantic lockfile no-op affected tasks`,
-      );
-    } else {
-      const expectedImporters = expectedTargets.map((target) => projects[target.split(":")[0]]);
-      if (expectedTargets.length === allTargets.length) expectedImporters.push(".");
-      assert.deepEqual(
-        projection.dependencyImporters,
-        expectedImporters.sort(),
-        `${name}: dependency importer projection differs`,
-      );
-    }
 
-    const affected = adapter(root, false);
-    assert.deepEqual(
-      affected.targets,
-      expectedTargets,
-      `${name}: adapter selected the wrong native build targets`,
+    entry.update = job(root, "deps-update");
+    assertSucceeded(entry.update, `${name}: native dependency-input update`);
+    entry.check = job(root, "deps-check");
+    assertSucceeded(entry.check, `${name}: native dependency-input check`);
+    const contents = generatedContents(root);
+    entry.changedGeneratedInputs = generatedPaths.filter(
+      (path) => contents[path] !== baselineContents[path],
     );
+    const expectedGenerated = buildTargets
+      .filter(() => !options.sourceOnly)
+      .map((target) => join(projects[target.split(":")[0]], ".moon-deps.json"));
+    if (options.tooling) expectedGenerated.push(".moon-deps.json");
     assert.deepEqual(
-      affected.run,
-      expectedTargets,
-      `${name}: dependency/source changes used a stale cache`,
+      entry.changedGeneratedInputs,
+      expectedGenerated.sort(),
+      `${name}: native update changed the wrong importer inputs`,
     );
-    assert.deepEqual(affected.cached, [], `${name}: changed targets unexpectedly hit cache`);
+    command(root, "git", ["add", "--all"]);
+    entry.head = commit(root, `Native dependency-input scenario: ${name}`);
+    entry.files = rawDiff(root, base, entry.head);
+    if (options.sourceOnly) assert.deepEqual(entry.files, [sourceFile]);
+    if (!buildTargets.length) assert.deepEqual(entry.files, ["pnpm-lock.yaml"]);
+    const expected = expectedTasks(buildTargets, options);
+    entry.query = queryTasks(root, entry.files);
+    assert.deepEqual(entry.query.targets, expected, `${name}: native affected task query differs`);
 
-    // An ordinary, unfiltered moon invocation must now hit every cache. This
-    // independently catches broad fingerprint invalidation outside the adapter.
-    const normal = nativeBuild(root);
-    assertCached(normal, allTargets, `${name}: normal native run after affected run`);
+    // Selection must be correct with no local task hashes, reports, or outputs
+    // cache. Keep this distinct from the subsequent ordinary-run hash checks.
+    rmSync(join(root, ".moon/cache"), { recursive: true, force: true });
+    entry.coldCI = nativeCI(root, base, entry.head, options.normalActions);
+    assertSucceeded(entry.coldCI, `${name}: cold native CI`);
+    assert.deepEqual(entry.coldCI.tasks, expected, `${name}: cold native CI selected wrong tasks`);
+    assert.deepEqual(
+      entry.coldCI.run,
+      expected,
+      `${name}: cold native CI did not execute selected tasks`,
+    );
+    assert.deepEqual(
+      entry.coldCI.cached,
+      [],
+      `${name}: cold native CI unexpectedly reused a cache`,
+    );
+    assert.deepEqual(entry.coldCI.skipped, [], `${name}: cold native CI skipped selected tasks`);
+
+    // Run all builds normally, then repeat them. A cold CI deliberately has no
+    // cache for unrelated builds, so only this second ordinary run must be warm.
+    entry.normal = nativeBuild(root);
+    assertSucceeded(entry.normal, `${name}: ordinary native build`);
+    assert.deepEqual(entry.normal.tasks, allTargets, `${name}: ordinary build scope differs`);
     const currentHashes = hashes(root);
-    const hashChangedTargets = allTargets.filter(
+    entry.hashChangedTargets = allTargets.filter(
       (target) => currentHashes[target] !== baselineHashes[target],
     );
     assert.deepEqual(
-      hashChangedTargets,
-      expectedTargets,
-      `${name}: native hashes invalidated the wrong projects`,
+      entry.hashChangedTargets,
+      buildTargets,
+      `${name}: native build hashes invalidated the wrong projects`,
     );
-    const entry = {
-      scenario: name,
-      ...mutation,
-      ...(installed ? { installedVersion: installed } : {}),
-      files: projection.files,
-      dependencyImporters: projection.dependencyImporters,
-      affectedTargets: affected.targets,
-      run: affected.run,
-      cached: affected.cached,
-      normalCached: normal.cached,
-      hashChangedTargets,
-      hashes: Object.fromEntries(
-        hashChangedTargets.map((target) => [target, currentHashes[target]]),
-      ),
-    };
+    entry.hashes = currentHashes;
+    entry.warm = nativeBuild(root);
+    assertCached(entry.warm, allTargets, `${name}: repeated ordinary native build`);
+    assert.deepEqual(hashes(root), currentHashes, `${name}: warm native build changed hashes`);
 
-    if (control) {
-      const manifestPath = join(root, projects.numbers, "package.json");
-      const changedManifest = readFileSync(manifestPath);
-      writeFileSync(manifestPath, baselineFiles.get(`${projects.numbers}/package.json`));
-      const rawFiles = command(root, "git", ["diff", "--name-only", "-z", "HEAD", "--"])
-        .split("\0")
-        .filter(Boolean)
-        .sort();
-      assert.deepEqual(
-        rawFiles,
-        ["pnpm-lock.yaml"],
-        "Native control must contain only a lockfile change",
-      );
-      const nativeControl = executeMoon(
-        root,
-        "moon",
-        [
-          "run",
-          ...allTargets,
-          ...nativeOptions,
-          "--affected",
-          "--stdin",
-          "--include-relations",
-          "--downstream",
-          "deep",
-        ],
-        JSON.stringify({ files: rawFiles }),
-      );
-      entry.nativeLockfileOnlyControl = {
-        files: rawFiles,
-        affectedTargets: nativeControl.targets,
-        run: nativeControl.run,
-        cached: nativeControl.cached,
-        matchesExpectedBranch:
-          JSON.stringify(nativeControl.targets) === JSON.stringify(expectedTargets),
-        ...(nativeControl.noActionGraph ? { noActionGraph: true } : {}),
-      };
-      writeFileSync(manifestPath, changedManifest);
-    }
-    evidence.scenarios.push(entry);
+    // Explicitly disable downstream expansion for this build-only request.
+    // Dependency updates select consumers through their own changed inputs;
+    // source propagation (including consumer tests) is proven by native CI.
+    entry.affectedBuild = moon(
+      root,
+      [
+        "run",
+        ":build",
+        "--affected",
+        "--stdin",
+        "--downstream",
+        "none",
+        ...nativeOptions,
+        "--no-actions",
+      ],
+      { input: JSON.stringify({ files: entry.files }) },
+    );
+    assertCached(
+      entry.affectedBuild,
+      options.sourceOnly ? ["numbers:build"] : buildTargets,
+      `${name}: native requested build-only scope`,
+    );
+    entry.status = "passed";
   }
 
   await scenario(
@@ -617,6 +899,7 @@ async function verify(root) {
         readLock(root).project.importers[projects.numbers],
         "is-odd",
       ).version;
+      assert.equal(before, "3.0.1");
       command(root, "pnpm", [
         "--filter",
         "@example/numbers",
@@ -629,15 +912,15 @@ async function verify(root) {
         readLock(root).project.importers[projects.numbers],
         "is-odd",
       ).version;
-      assert.notEqual(after, before, "pnpm did not update numbers' actual locked package version");
       assert.equal(after, "3.0.0");
       const changedManifest = JSON.parse(
         readFileSync(join(root, projects.numbers, "package.json"), "utf8"),
       );
+      assert.equal(changedManifest.dependencies["is-odd"], "3.0.0");
       assert.equal(
-        changedManifest.dependencies["is-odd"],
-        "3.0.0",
-        "Direct scenario must retain pnpm's manifest update",
+        installedVersion(root, projects["legacy-numbers"], "is-odd"),
+        baselineInstalled.legacy,
+        "Direct dependency update changed legacy's same-name package",
       );
       return {
         package: "is-odd",
@@ -645,47 +928,14 @@ async function verify(root) {
         before,
         after,
         generatedBy: "pnpm add with isolated install",
-        excludes: ["legacy-numbers:build", ...colorTargets].sort(),
       };
     },
-    { control: true },
+    { normalActions: true },
   );
 
-  await scenario("transitive-only-version", numberTargets, async () => {
-    const lock = readLock(root);
-    const odd = dependency(lock.project.importers[projects.numbers], "is-odd").version;
-    const legacyOdd = dependency(
-      lock.project.importers[projects["legacy-numbers"]],
-      "is-odd",
-    ).version;
-    const oddSnapshot = snapshot(lock.project, "is-odd", odd).value;
-    const legacySnapshot = snapshot(lock.project, "is-odd", legacyOdd).value;
-    const before = oddSnapshot.dependencies["is-number"];
-    const legacyReference = legacySnapshot.dependencies["is-number"];
-    assert.notEqual(before, legacyReference, "Fixture must contain isolated is-number versions");
-    const metadata = await registryPackage("is-number", "7.0.0");
-    oddSnapshot.dependencies["is-number"] = addLeafVersion(
-      lock.project,
-      "is-number",
-      before,
-      metadata,
-    );
-    writeLock(root, lock);
-    assert.equal(
-      snapshot(readLock(root).project, "is-odd", legacyOdd).value.dependencies["is-number"],
-      legacyReference,
-    );
-    return {
-      package: "is-number",
-      importer: projects.numbers,
-      via: "is-odd",
-      before,
-      after: metadata.version,
-      unchangedLegacyVersion: legacyReference,
-      generatedBy:
-        "registry metadata and lock snapshot edge update under stable scoped override, followed by frozen install",
-    };
-  });
+  await scenario("transitive-only-version", numberTargets, async () =>
+    changeTransitive(root, transitiveMetadata),
+  );
 
   await scenario("other-dependency-branch", colorTargets, async () => {
     const before = dependency(
@@ -728,52 +978,72 @@ async function verify(root) {
     return { mutation: "Reordered YAML mapping keys without changing any parsed value" };
   });
 
-  await scenario("shared-root-tooling", allTargets, async () => {
-    const before = dependency(readLock(root).project.importers["."], "yaml").version;
-    command(root, "pnpm", [
-      "add",
-      "--workspace-root",
-      "--save-dev",
-      "yaml@2.8.1",
-      "--save-exact",
-      ...isolatedInstallOptions,
-    ]);
-    const after = dependency(readLock(root).project.importers["."], "yaml").version;
-    assert.equal(after, "2.8.1");
-    assert.notEqual(after, before);
-    return {
-      package: "yaml",
-      importer: ".",
-      before,
-      after,
-      generatedBy: "pnpm add with isolated install",
-    };
-  });
+  await scenario(
+    "shared-root-tooling",
+    allTargets,
+    async () => {
+      const before = dependency(readLock(root).project.importers["."], "yaml").version;
+      command(root, "pnpm", [
+        "add",
+        "--workspace-root",
+        "--save-dev",
+        "yaml@2.8.1",
+        "--save-exact",
+        ...isolatedInstallOptions,
+      ]);
+      const after = dependency(readLock(root).project.importers["."], "yaml").version;
+      assert.equal(after, "2.8.1");
+      assert.notEqual(after, before);
+      return {
+        package: "yaml",
+        importer: ".",
+        before,
+        after,
+        generatedBy: "pnpm add with isolated install",
+      };
+    },
+    { tooling: true },
+  );
 
   await scenario(
     "source-only-with-consumers",
     numberTargets,
     async () => {
-      writeFileSync(
-        join(root, sourceFile),
-        `${baselineFiles.get(sourceFile).toString()}\n// Scratch-only source change for native affected verification.\n`,
-      );
-      return { mutation: sourceFile };
+      const original = baselineFiles.get(sourceFile).toString();
+      writeFileSync(join(root, sourceFile), `${original}\n// Native source-input verification.\n`);
+      return {
+        mutation: sourceFile,
+        semantics: "Equivalent parity classification; consumer tests execute in CI",
+      };
     },
     { sourceOnly: true },
   );
-
-  restore();
-  return evidence;
 }
 
-const temporary = mkdtempSync(join(tmpdir(), "moon-pnpm-deps-verify-"));
+function reportArgument(args) {
+  if (args.length === 0) return null;
+  if (args.length === 2 && args[0] === "--report" && args[1]) return resolve(args[1]);
+  throw new Error("Usage: node tools/pnpm-deps/verify.mjs [--report <path>]");
+}
+
+const evidence = { version: 1, status: "running", checks: {}, scenarios: [] };
+let temporary;
+let reportPath;
 try {
-  const evidence = await verify(join(temporary, "workspace"));
-  console.log(JSON.stringify(evidence));
+  reportPath = reportArgument(process.argv.slice(2));
+  temporary = mkdtempSync(join(tmpdir(), "moon-pnpm-deps-verify-"));
+  await verify(join(temporary, "workspace"), evidence);
+  evidence.status = "passed";
 } catch (error) {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : error);
+  evidence.status = "failed";
+  evidence.error = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  console.error(evidence.error);
   process.exitCode = 1;
 } finally {
-  rmSync(temporary, { recursive: true, force: true });
+  if (temporary) rmSync(temporary, { recursive: true, force: true });
+  if (reportPath) {
+    mkdirSync(dirname(reportPath), { recursive: true });
+    writeFileSync(reportPath, `${JSON.stringify(evidence, null, 2)}\n`);
+  }
+  console.log(JSON.stringify(evidence));
 }

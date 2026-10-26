@@ -7,11 +7,11 @@
     "build": "moon run :build",
     "test": "moon run :test root:test-extension",
     "test:extension": "moon run root:test-extension",
+    "typecheck": "moon run root:typecheck",
     "lint": "moon run :lint",
     "format-check": "moon run :format-check",
     "format": "oxfmt .",
-    "affected": "node tools/pnpm-deps/cli.mjs affected",
-    "verify-deps": "node tools/pnpm-deps/verify.mjs"
+    "verify-deps": "moon run root:verify-deps"
   },
   "devDependencies": {
     "@moonrepo/cli": "2.6.4",

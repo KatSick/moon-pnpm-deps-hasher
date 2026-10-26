@@ -1,10 +1,8 @@
-# Selective pnpm dependency updates with moon
+# Native moon dependency invalidation for pnpm
 
-A pnpm workspace using moon, proto, Vite, Vitest, Oxlint, and Oxfmt. Dependency updates invalidate only the projects whose **resolved dependency closures** change and their workspace consumers. Unrelated projects retain their task caches.
+A pnpm 12 workspace with precise dependency-update inputs for moon 2.6. Use ordinary **moon commands** for builds, tests, affected queries, and CI. No command wrapper, affected-project adapter, or WASM plugin is required.
 
 ## Toolchain
-
-Exact stable releases, resolved from the official release feeds and npm registry when this example was created:
 
 | Tool       | Version |
 | ---------- | ------- |
@@ -18,236 +16,189 @@ Exact stable releases, resolved from the official release feeds and npm registry
 | Oxfmt      | 0.74.0  |
 | TypeScript | 7.0.2   |
 
-`.prototools` owns the runtime versions; `.moon/toolchains.yml` inherits Node and pnpm versions and pins moon's proto integration. The root manifest pins JavaScript tooling, and `pnpm-lock.yaml` is committed for frozen installs. The deliberately different example dependency versions are fixtures, not recommendations for application dependencies.
+`.prototools` pins the runtime tools; `.moon/toolchains.yml` inherits Node/pnpm versions and pins proto. The manifest and committed pnpm lockfile pin JavaScript tooling. Older versions of the example dependencies are deliberate isolation fixtures, not application dependency recommendations.
 
-## Workspace graph
+## Workspace
 
 Arrows mean “consumed by”:
 
 ```text
 is-odd@3.0.1 → numbers → reports → dashboard
-                 └── is-number@6.0.0 (external transitive dependency)
+  └─ is-number@6.0.0
 
 picocolors@1.1.1 → colors → palette
 
 is-odd@2.0.0 → legacy-numbers
-                 └── is-number@4.0.0 (separate resolved version)
+  └─ is-number@4.0.0
 ```
 
-All six projects have Vite library builds and Vitest tests. Shared tasks are inherited by the `example` tag; moon infers workspace dependency relationships from `workspace:*` declarations. Build tasks depend on `^:build`; tests build their workspace dependencies before importing their output.
+All six projects have Vite builds, Vitest tests, Oxlint, and Oxfmt tasks. Moon infers workspace relationships from `workspace:*` dependencies. Builds depend on `^:build`, and tests build their workspace dependencies before importing their output.
 
-## Setup and commands
+## Setup
 
-Install [proto](https://moonrepo.dev/docs/proto/install), then:
+Install [proto](https://moonrepo.dev/docs/proto/install), inspect the repository configuration, then:
 
 ```sh
-# Inspect the configuration before trusting its proto self-version pin.
 proto trust .prototools
 proto install --config-mode local
 pnpm install --frozen-lockfile
-
-pnpm build
-pnpm test
-pnpm lint
-pnpm format-check
-pnpm exec tsc --noEmit
-pnpm format
+moon run root:deps-check
+moon sync vcs-hooks
 ```
 
-Normal moon commands require a Git history and a resolvable default branch. This example configures `main`; adjust `vcs.defaultBranch` in `.moon/workspace.yml` for another repository. No commits or branches are created in your checkout by the verifier below. On an unborn branch, use `pnpm verify-deps` to exercise the complete workspace in a disposable repository instead.
+`moon sync vcs-hooks` installs the configured pre-commit hook using moon's native hook integration. Generated `.moon/hooks/` scripts are ignored; the hook definition is committed in `.moon/workspace.yml`. Integrate any existing custom Git hooks before changing their routing.
 
-After updating dependencies, run:
+Moon needs Git history and a resolvable default branch (`main` here). CI must fetch the relevant base and head history; shallow checkouts cannot reliably determine affected tasks.
+
+## Native jobs and dependency updates
+
+| Job                   | Purpose                                                                            | Runs automatically in CI? |
+| --------------------- | ---------------------------------------------------------------------------------- | ------------------------- |
+| `root:deps-update`    | Update changed `.moon-deps.json` files and prune owned files for removed importers | No                        |
+| `root:deps-check`     | Read-only validation against the current lockfile                                  | Always; not cached        |
+| `root:test-extension` | Graph-engine and generated-input regression tests                                  | When affected             |
+| `root:typecheck`      | TypeScript checking across the workspace                                           | When affected             |
+| `root:verify-deps`    | Disposable native moon E2E scenarios and hook checks                               | Always; not cached        |
+
+After changing dependencies:
+
+1. Update/install dependencies with pnpm.
+2. Run `moon run root:deps-update`.
+3. Review and stage the changed manifests, `pnpm-lock.yaml`, and generated `.moon-deps.json` files, including deletions.
+4. Commit normally. The native pre-commit hook checks the **Git index**.
 
 ```sh
-# Compare a baseline commit with the current working tree, including untracked files.
-pnpm affected --base HEAD -- :build :test
-
-# Inspect projected changed paths and dependency importers without running moon.
-pnpm affected --base HEAD --dry-run -- :build
-
-# CI: compare two commits after checking out the head with a clean working tree.
-pnpm affected --base origin/main --head HEAD -- :build :test :lint :format-check
-
-# Inspect a project's current cache fingerprint.
-node tools/pnpm-deps/cli.mjs fingerprint --project packages/numbers
+moon run root:deps-update
+moon run root:deps-check
+moon run root:deps-check -- --staged
 ```
 
-`--base` is required. This compares the two specified trees directly, not their merge base; pass the merge-base commit explicitly if your CI needs merge-base semantics. Without `--head`, staged, unstaged, deleted, renamed, and nonignored untracked source paths are included. An explicit `--head` can reference any commit for dry runs; execution requires the checked-out `HEAD` and a clean working tree so the compared graph matches the code being built.
+`deps-update` never stages files. `deps-check` never rewrites them. A fresh working-tree snapshot does **not** make a stale staged snapshot valid: the hook reads the staged lockfile and staged generated files, not their working-tree replacements.
 
-Install the updated lockfile before running tasks. Moon's normal toolchain integration also installs dependencies when required. Supported selectors are `:task`, `project:task`, and `#tag:task`; put all selectors before execution options. The adapter forwards `--force`/`-f`, `--interactive`/`-i`, `--no-actions`, `--output-style`, `--job`, `--job-total`, and `--summary`/`-s`. A second `--` forwards arguments to the underlying task. Globs, default/closest-project locators, task-tag locators, `--query`, execution plans, and overriding the adapter's affected/graph settings are rejected explicitly.
+The updater is intentionally excluded from CI. For an explicitly requested maintenance update in a shell that already sets `CI=true`, use the native override `moon exec --ci=false root:deps-update`; CI itself must check committed inputs, not silently repair them.
 
-## How moon is extended
+## Normal moon commands
 
-There is no upstream `projectsAffectedByDependencyUpdates: auto` setting added by this repository. It implements the equivalent workflow through two supported moon interfaces, without a core fork or a WASM plugin.
-
-### 1. Precise task cache fingerprints
-
-[Native fingerprint checks](https://moonrepo.dev/docs/config/project#fingerprint) mix a command's stdout into each task hash:
-
-```yaml
-checks:
-  - check: fingerprint
-    script: node ../../tools/pnpm-deps/cli.mjs fingerprint
-    hash: stdout
+```sh
+moon run :build
+moon run :test root:test-extension root:typecheck
+moon run :lint :format-check
+moon run :build --affected
+moon query affected
+moon ci --include-relations --downstream deep
 ```
 
-The relative path is intentional: checks execute from the project directory but do not expand task tokens. All example projects are two directories below the workspace root. Root tasks use `node tools/pnpm-deps/cli.mjs fingerprint` instead.
+Dependency snapshots include workspace dependency closures, so a dependency update changes the snapshots of transitive workspace consumers as well. These are ordinary changed inputs to moon, including in explicit base/head comparisons.
 
-`tools/pnpm-deps/lock-graph.mjs` follows each importer's dependency, dev-dependency, optional-dependency, and workspace-link edges. It includes complete peer/patch snapshot identities, package resolution metadata and integrity, and transitive package snapshots. Different versions of the same package remain separate graph nodes. Object-key order does not affect fingerprints.
+The CI command includes native relation tracking and deep downstream traversal to cover source changes through task dependencies too. These flags have moon's normal graph semantics: a focused build request with downstream expansion may also include dependent test tasks. There is no custom target filtering here.
 
-The fingerprint also includes the root importer's closure, because Vite, Vitest, and OXC are shared root tooling. A shared tool update intentionally invalidates every project. pnpm 12 can emit two YAML documents: the final project document is traversed, and preceding boot/tooling documents are hashed separately. See [pnpm's lockfile documentation](https://github.com/pnpm/pnpm/blob/main/pnpm/docs/lockfile.md).
+Bare `moon ci` also includes the mandatory freshness check and E2E task. The GitHub workflow runs the freshness check **separately first**, ensuring stale metadata fails before affected CI work starts. The independent checker is deliberately not a dependency of every project task, which would broaden dependency-based affected selection.
 
-`.moon/workspace.yml` sets [hasher.optimization: performance](https://moonrepo.dev/docs/config/workspace#optimization). Moon still hashes manifest requirements, but its generic lockfile dependency hashing is bypassed; the fingerprint supplies the exact resolved closure, including transitive dependencies. This avoids mixing our precise result with moon's generic dependency-name matching. The shared lockfile is deliberately **not** a global file input.
+## How generated inputs work
 
-Ordinary unfiltered `moon run :build` therefore also benefits from selective cache invalidation.
+Each pnpm importer, including the workspace root, has a tracked `.moon-deps.json` containing a generator marker, schema version, importer ID, and SHA-256 hash. The hash identifies:
 
-### 2. Precise affected-task selection
+- Its complete resolved package closure: direct, dev, optional, transitive, and workspace dependencies.
+- Full peer/patch snapshot identities and package resolution/integrity metadata.
+- The root importer's dependency closure, treated as shared tooling.
+- Any preceding boot/tooling YAML documents in pnpm 12's lockfile.
 
-A changed task hash does **not** make a task affected. `--affected` filters tasks before their cache fingerprint can rescue an omitted task.
+Mapping order and YAML formatting do not affect the generated hash. Different versions of the same package remain separate graph nodes. An unrelated dependency update leaves a project's generated file unchanged.
 
-`tools/pnpm-deps/cli.mjs affected` compares the base and current resolved graphs. It replaces a changed root `pnpm-lock.yaml` path with only the changed importers' existing `package.json` paths, preserving ordinary source changes. Selection and execution then use separate native moon phases:
+The custom implementation is limited to:
 
-1. `moon action-graph <requested targets> --json` expands the requested selectors and required upstream tasks.
-2. `moon query affected --upstream none --downstream deep` receives projected `{"files":[...]}` on stdin and computes affected tasks, including transitive consumers.
-3. The adapter intersects those native task sets and executes `moon run --upstream deep --downstream none <exact affected targets>`.
+- `tools/pnpm-deps/lock-graph.mjs`: selects canonical resolved closures from pnpm schema 9.0.
+- `tools/pnpm-deps/inputs.mjs`: generates files or checks the working tree/Git index.
 
-This separation matters: `moon run --downstream deep` also expands its **action graph**, potentially adding dependent test tasks to a build-only request. Querying downstream affected state first preserves source-change propagation without running unrequested dependent task types. Required upstream tasks can still run or hit cache normally.
+Neither module chooses moon targets or invokes moon. Moon owns affected-input matching, graph traversal, task ordering, hashing, execution, and caching.
 
-Moon owns selector expansion, affected-input matching, graph traversal, dependency ordering, execution, and caching. The adapter does not implement a second workspace/task graph. See the [action graph export](https://moonrepo.dev/docs/commands/action-graph), [moon stdin parser](https://github.com/moonrepo/moon/blob/v2.6.4/crates/app/src/queries/changed_files.rs), and [affected graph semantics](https://moonrepo.dev/docs/concepts/affected). Dry runs report the file/importer projection only; they do not execute these native planning queries.
+The example-tag task configuration requires each project's generated file as a [native file input](https://moonrepo.dev/docs/config/project#inputs). `.moon/workspace.yml` keeps `hasher.optimization: performance`, so moon hashes manifest requirements rather than adding generic lockfile-resolution matching to the precise generated input. The **whole shared lockfile is not a global project-task input**.
 
-**Use `pnpm affected`, not bare `moon run --affected`, for dependency-update selection.** Bare moon does not perform this lockfile-to-project projection. No generated marker files or tracked per-project lockfiles are required.
+This gives exact affected-task selection even with empty caches. It is not a “consider every task and hope unrelated tasks hit cache” workaround. Root-level freshness checking intentionally reads the whole lockfile; workspace-wide type checking and shared tooling checks have their own broader inputs.
+
+Do not edit generated files manually. Updates only replace recognized generated files and prune recognized orphan files; unowned/corrupt files and symlink paths are rejected rather than overwritten.
+
+## GitHub Actions CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pull requests, pushes to `main`, and manual dispatch:
+
+1. Full-history checkout.
+2. Official [`moonrepo/setup-toolchain`](https://github.com/moonrepo/setup-toolchain) with `auto-install: true`, using the repository's pinned versions.
+3. `pnpm install --frozen-lockfile`.
+4. Unconditional `moon run root:deps-check`.
+5. `moon ci --include-relations --downstream deep`, including native E2E verification.
+6. Upload current successful CI and E2E reports.
+
+Actions use immutable commit pins with release comments. The setup action caches **proto tools**, not moon task state, so GitHub runners do not rely on a warm moon task cache. Repository permissions are read-only; no PR-comment or repository-write token is required.
+
+The native CI report is `.moon/cache/ciReport.json`. E2E evidence is `.moon/cache/dependency-inputs-e2e.json`; both are uploaded as workflow artifacts after successful verification.
+
+### Solo-maintainer repository policy
+
+Changes to `main` require a pull request and the **Native moon CI** check from GitHub Actions to pass against an up-to-date branch. No review approvals are required, so the owner does not need a self-review. These protections apply to administrators too: no admin bypass, force pushes, or branch deletion. Conversations must be resolved, history must be linear, and squash merging is the only enabled merge method.
+
+Actions use a read-only default token and cannot approve pull requests. Repository policy requires full commit-SHA action pins and allows only GitHub-owned actions plus `moonrepo/setup-toolchain`. Workflow runs from all external fork contributors require maintainer approval; public forks and external pull requests remain possible.
+
+New runs cancel stale runs for the same workflow and pull request or ref. The CI job has a 15-minute timeout.
+
+## End-to-end verification
+
+```sh
+moon run root:verify-deps
+```
+
+The verifier creates its own Git repository and private dependency installation, invokes the real native check/update tasks, installs and exercises the native pre-commit hook, and reads actual moon reports, installed package versions, and persisted hashes. It cleans its temporary workspace in `finally` and does not commit or change your checkout's Git hook routing.
+
+It covers:
+
+- Missing, stale, fresh, and idempotent generated-input transitions.
+- A stale staged snapshot rejected despite fresh unstaged working-tree data; a coherent staged commit accepted by the actual hook.
+- Native CI rejecting an intentionally stale lockfile-only commit even when project tasks would otherwise be omitted.
+- Direct, transitive-only, different-version, and separate-branch dependency updates.
+- Cold-cache native affected queries and CI selection; unaffected project tasks must be absent, not just cached.
+- Semantic lockfile no-ops, shared root tooling updates, ordinary source changes, and selective warm-cache reuse.
+
+| Dependency scenario                          | Relevant project tasks                         |
+| -------------------------------------------- | ---------------------------------------------- |
+| `is-odd` 3.0.1 → 3.0.0                       | numbers, reports, dashboard                    |
+| Only numbers' transitive `is-number` 6 → 7   | numbers, reports, dashboard; legacy stays on 4 |
+| `picocolors` 1.1.1 → 1.1.0                   | colors, palette                                |
+| YAML key reordering without semantic changes | No project tasks                               |
+| Shared root `yaml` tooling update            | All six projects                               |
+
+Root bookkeeping checks are accounted for separately. The fixture disables only its own `verify-deps` job to prevent recursive E2E execution; the mandatory freshness checker remains enabled. The transitive case predeclares a scratch-only scoped override accepting versions 6 or 7, then performs a real frozen install of the changed graph. Downgrades are reproducible version-change fixtures.
+
+Registry access is required. The report parser targets pinned moon 2.6.4: CI uses `ciReport.json`, other executions use `runReport.json`, and task hashes live in per-task `lastRun.json` files. A root project can appear as ancestor metadata in native affected queries without having affected task commands.
 
 ## Adopt this in another pnpm 12 / moon 2.6 workspace
 
-This section covers **only the custom dependency-update integration**. Keep your existing projects, commands, toolchains, proto setup, build tools, and task dependencies; none of the demo packages or Vite/OXC configuration is required.
+Only the custom integration is needed; keep your existing applications, build commands, proto setup, and native JavaScript/pnpm toolchains.
 
-### 1. Copy the two runtime modules
+1. Copy `lock-graph.mjs` and `inputs.mjs` into `tools/pnpm-deps/` and install `yaml` in the workspace root. The module location defines the workspace root two directories above it.
+2. Define native root `deps-update` and `deps-check` tasks as in `moon.yml`: both uncached, updater excluded from CI, checker `runInCI: always` with the raw lockfile and generated files as its own inputs.
+3. Add the generated input to dependency-consuming tasks, preserving their existing commands, inputs, outputs, and dependency edges:
 
-Copy these files, preserving their location relative to the workspace root:
+   ```yaml
+   implicitInputs:
+     - file: .moon-deps.json
+       optional: false
+   ```
 
-```text
-tools/pnpm-deps/
-├── cli.mjs
-└── lock-graph.mjs
-```
+   Scope this inherited configuration to the relevant projects/tasks. **Do not require the generated file on maintenance jobs**: they must be able to detect or repair missing files. This example scopes it using the `example` tag and gives root test/typecheck tasks explicit inputs.
 
-Install their only non-built-in runtime dependency in the workspace root:
+4. Keep `hasher.optimization: performance`. Remove any whole-lockfile input or broad root glob that would invalidate every project. Keep root manifest/shared configuration and generator source files as appropriate inputs.
+5. Run the native update job, review the output, and commit all generated files with the lockfile. The importer ID is a workspace-relative directory, not a moon project ID.
+6. Merge the staged pre-commit check into your native `vcs.hooks`, enable `vcs.sync`, and install with `moon sync vcs-hooks`. Do not replace unrelated existing hook commands.
+7. In CI, install frozen dependencies, run the native freshness checker unconditionally **before** `moon ci`, and fetch enough Git history. Do not auto-update generated files in CI to hide stale commits.
+8. Adapt behavioral E2E scenarios to your own dependency branches. This example's `verify.mjs` intentionally knows its six fixture projects and is not a generic drop-in workspace runner. The two unit-test modules are regression coverage, not runtime dependencies.
 
-```sh
-pnpm add --workspace-root --save-dev --save-exact yaml@2.9.1
-```
-
-The CLI locates the workspace two directories above its own file and reads the root `pnpm-lock.yaml`. Each instrumented moon project must correspond to a pnpm importer; the importer ID is its workspace-relative directory, not its moon project ID. This implementation assumes one shared root lockfile with schema 9.0 and handles pnpm 12's separate boot document.
-
-The two `*.test.mjs` files are optional regression coverage, not runtime dependencies. `verify.mjs` is specific to this example's six projects and dependency fixtures: do **not** copy it unchanged as a generic verifier.
-
-### 2. Add a fingerprint to dependency-sensitive tasks
-
-Merge this fragment into each existing task that must invalidate when its resolved dependencies change. Preserve its command, dependency edges, outputs, existing checks, and source inputs:
-
-```yaml
-# In an existing project task, or a shared inherited task definition.
-tasks:
-  build:
-    inputs:
-      - package.json
-    checks:
-      - check: fingerprint
-        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
-        hash: stdout
-```
-
-Repeat the check for relevant test, lint, code-generation, or other cached tasks—not just `build`. Use your existing task inheritance rules; the demo's `example` tag is not required.
-
-Two details are necessary for correctness:
-
-- Include the project's `package.json` in its task inputs. The affected adapter projects a dependency change onto that path even when its file contents have not changed.
-- Adjust the script's relative path for the task's working directory. The fragment assumes a depth-two project such as `packages/core`. A root task uses `node tools/pnpm-deps/cli.mjs fingerprint`. Checks do not expand `$workspaceRoot`. By default, the fingerprint derives its importer from the working directory; if that differs from the project directory, pass an explicit importer, for example `fingerprint --project packages/core`.
-
-Merge these integration inputs into a shared `.moon/tasks/*.yml` definition inherited by the relevant tasks:
-
-```yaml
-implicitInputs:
-  - /package.json
-  - /pnpm-workspace.yaml
-  - /.moon/**/*.yml
-  - /tools/pnpm-deps/cli.mjs
-  - /tools/pnpm-deps/lock-graph.mjs
-```
-
-Keep your other shared configuration inputs. Root `package.json` must affect every instrumented task because root-tooling changes are projected onto it. Changes to the custom hashing implementation must also invalidate existing caches.
-
-Remove the **whole shared lockfile** from global/task file inputs that would invalidate every project. Audit broad root globs as well as explicit `/pnpm-lock.yaml` entries. Do not remove project source inputs or native task dependency edges.
-
-### 3. Let the custom fingerprint own resolved dependency hashing
-
-After all dependency-sensitive tasks have their fingerprint checks, merge this into `.moon/workspace.yml`:
-
-```yaml
-hasher:
-  optimization: performance
-```
-
-This bypasses moon's generic lockfile-resolution hashing, not its manifest hashing. The custom check supplies the precise resolved closure instead. The setting is workspace-wide: applying it without instrumenting relevant tasks would weaken their dependency invalidation. In a polyglot workspace, account for its effect on other toolchains before adopting it globally.
-
-### 4. Route dependency-aware affected runs through the CLI
-
-Add this root manifest script:
-
-```json
-{
-  "scripts": {
-    "affected": "node tools/pnpm-deps/cli.mjs affected"
-  }
-}
-```
-
-After installing an updated lockfile, use:
-
-```sh
-pnpm affected --base HEAD --dry-run -- :build
-pnpm affected --base HEAD -- :build :test
-```
-
-In CI, check out the head revision and pass the intended baseline with `--base`; add `--head HEAD` only with a clean working tree. The supported selectors and execution options are listed above.
-
-The custom CLI performs the lockfile-to-importer projection and intersects moon's native requested-task graph with its native affected-task set. Moon still owns workspace relationships, selector expansion, source-input matching, task ordering, execution, and caching. Keep your native JavaScript/pnpm integration and task dependency edges configured; no moon plugin registration, WASM build, or generated per-project lockfile is needed.
-
-### 5. Verify isolation with your own packages
-
-Establish a baseline build, then check a direct update, an external transitive-only update, and a dependency version used by only one branch of your workspace. Assert both the selected tasks and native task hashes/cache statuses: unaffected projects must not execute or change hashes, while affected consumers must rebuild. A subsequent unfiltered build should hit the caches populated by the affected run. Also check a semantic lockfile no-op and a shared tooling update.
-
-The unchanged implementation deliberately treats **every root-importer dependency** and boot-tooling document as shared by all tasks. Keep project-specific dependencies in their project importers if you need isolation. Shared configuration/settings changes remain conservative global invalidations; the other supported-input boundaries are listed below.
-
-## End-to-end proof
-
-```sh
-pnpm verify-deps
-```
-
-The verifier copies the workspace into a temporary Git repository, installs its own dependencies without lifecycle scripts, runs actual moon/Vite builds, runs the workspace's Vitest/OXC tasks, and reads moon's task statuses and persisted hashes. It does not modify or commit your working tree. Registry access is required for the published versions used by the scenarios.
-
-It asserts the following, then emits a JSON evidence record:
-
-| Scenario                                           | Builds invalidated/executed |
-| -------------------------------------------------- | --------------------------- |
-| `is-odd` 3.0.1 → 3.0.0 using real `pnpm add`       | numbers, reports, dashboard |
-| Only numbers' transitive `is-number` 6 → 7 changes | numbers, reports, dashboard |
-| `picocolors` 1.1.1 → 1.1.0                         | colors, palette             |
-| YAML mapping order changes, graph unchanged        | none                        |
-| Shared root `yaml` tooling version changes         | all six                     |
-| numbers source changes, lockfile unchanged         | numbers, reports, dashboard |
-
-Downgrades are intentional, reproducible dependency-update fixtures. The transitive case declares a stable **scratch-only** scoped override accepting versions 6 or 7 before establishing its baseline. It then changes only the resolved transitive edge, performs a frozen install, and checks the installed version; legacy-numbers stays on version 4. The example checkout's dependency policy is untouched.
-
-Every scenario verifies both native affected execution and a subsequent unfiltered moon build: unaffected task hashes stay identical and the unfiltered build hits all six caches. The verifier also records a native lockfile-only affected run without the adapter as a control.
-
-The verifier's report reader targets pinned moon 2.6.4 (`.moon/cache/runReport.json` and per-task `lastRun.json`). Update it deliberately when changing moon versions.
+Generated inputs must reflect the **final** lockfile and be included in the compared Git revisions. Generating ignored files during a moon graph/sync hook is not equivalent: changed-file collection may already have happened, graph hooks may be cached, and revision comparisons do not include arbitrary worktree-only generation. See the [affected model](https://moonrepo.dev/docs/concepts/affected) and [graph extension contract](https://github.com/moonrepo/moon/blob/v2.6.4/crates/pdk-api/src/common.rs#L58-L110).
 
 ## Boundaries
 
-- Root tooling, boot tooling, global lockfile settings/checksums, and shared configuration changes conservatively affect every project.
-- Catalog and exact/name-only patch declarations are scoped to reachable packages. Ranged patches use their resolved `patch_hash` identity. Override declarations are resolution policy; effective changes are tracked through resolved graph edges.
-- Only pnpm lockfile schema 9.0 is accepted. Unknown schemas and missing graph entries fail rather than silently reuse stale caches.
-- Workspace `link:` references and injected directory dependencies must map to lockfile importers. External mutable directories/links, publish-directory links that do not map to an importer, unresolved `workspace:` locators, and file tarballs without integrity are rejected.
-- Lockfile snapshots do not hash mutable local source contents. Normal moon source inputs and task dependency hashes remain responsible for source changes.
+- One shared root pnpm lockfile, schema 9.0. All YAML documents are parsed; the final document is the project graph.
+- Every root-importer dependency is shared tooling. Put project-specific dependencies in project importers if you need isolation. Boot/tooling and global settings/checksums conservatively affect all projects.
+- Catalog and exact/name-only patches are reachability-scoped; ranged patches use resolved `patch_hash` identities. Overrides are resolution policy; effective changes are tracked through resolved edges.
+- External mutable directory/link dependencies, unresolved workspace references, unsupported publish-directory links, and file tarballs without integrity fail explicitly.
+- Lockfile fingerprints do not replace normal source inputs or native task dependency hashes.
+- Generated files are required tracked inputs. Missing/stale inputs are errors, not an invitation for CI or hooks to mutate the commit automatically.
