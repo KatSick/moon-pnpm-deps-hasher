@@ -1,0 +1,17 @@
+$schema: https://moonrepo.dev/schemas/workspace.json
+
+projects:
+  root: .
+  numbers: packages/numbers
+  legacy-numbers: packages/legacy-numbers
+  reports: packages/reports
+  dashboard: apps/dashboard
+  colors: packages/colors
+  palette: apps/palette
+
+# Native fingerprint checks provide precise resolved dependency closures.
+hasher:
+  optimization: performance
+
+vcs:
+  defaultBranch: main

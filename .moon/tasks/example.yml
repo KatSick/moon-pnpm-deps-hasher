@@ -1,0 +1,53 @@
+inheritedBy:
+  tags: [example]
+
+fileGroups:
+  project:
+    - src/**/*
+    - package.json
+    - tsconfig.json
+    - vite.config.ts
+    - moon.yml
+
+tasks:
+  build:
+    command: vite build
+    deps:
+      - ^:build
+    inputs:
+      - "@group(project)"
+    outputs:
+      - dist
+    checks:
+      - check: fingerprint
+        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
+        hash: stdout
+
+  test:
+    command: vitest run
+    deps:
+      - ^:build
+    inputs:
+      - "@group(project)"
+    checks:
+      - check: fingerprint
+        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
+        hash: stdout
+
+  lint:
+    command: oxlint --deny-warnings --config "$workspaceRoot/.oxlintrc.json" .
+    inputs:
+      - "@group(project)"
+    checks:
+      - check: fingerprint
+        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
+        hash: stdout
+
+  format-check:
+    command: oxfmt --check --config "$workspaceRoot/.oxfmtrc.json" .
+    inputs:
+      - "@group(project)"
+    checks:
+      - check: fingerprint
+        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
+        hash: stdout

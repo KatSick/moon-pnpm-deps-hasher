@@ -1,0 +1,12 @@
+proto:
+  version: 0.63.2
+
+javascript:
+  packageManager: pnpm
+  inferTasksFromScripts: false
+
+node:
+  versionFromPrototools: true
+
+pnpm:
+  versionFromPrototools: true

@@ -1,0 +1,8 @@
+language: typescript
+layer: library
+toolchains:
+  default: node
+tags:
+  - example
+dependsOn:
+  - numbers

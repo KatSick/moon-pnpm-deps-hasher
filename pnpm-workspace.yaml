@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - packages/*
+
+saveExact: true
+
+# Approve Vite's optional native macOS watcher.
+allowBuilds:
+  fsevents: true
