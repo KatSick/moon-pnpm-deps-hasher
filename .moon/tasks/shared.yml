@@ -1,0 +1,10 @@
+# Dependency closures come from fingerprint checks, not the whole lockfile.
+implicitInputs:
+  - /package.json
+  - /.prototools
+  - /pnpm-workspace.yaml
+  - /tsconfig.json
+  - /.oxlintrc.json
+  - /.oxfmtrc.json
+  - /.moon/**/*.yml
+  - /tools/pnpm-deps/**/*.mjs

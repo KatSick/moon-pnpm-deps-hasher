@@ -1,0 +1,19 @@
+language: javascript
+layer: tool
+
+toolchains:
+  default: node
+
+workspace:
+  inheritedTasks:
+    include: []
+
+tasks:
+  test-extension:
+    command: vitest run tools/pnpm-deps
+    inputs:
+      - tools/pnpm-deps/**/*.mjs
+    checks:
+      - check: fingerprint
+        script: node tools/pnpm-deps/cli.mjs fingerprint
+        hash: stdout
