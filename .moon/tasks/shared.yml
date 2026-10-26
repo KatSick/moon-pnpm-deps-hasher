@@ -1,4 +1,4 @@
-# Dependency closures come from fingerprint checks, not the whole lockfile.
+# Tracked per-project dependency inputs replace broad lockfile invalidation.
 implicitInputs:
   - /package.json
   - /.prototools

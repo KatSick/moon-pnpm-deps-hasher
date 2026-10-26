@@ -13,7 +13,54 @@ tasks:
     command: vitest run tools/pnpm-deps
     inputs:
       - tools/pnpm-deps/**/*.mjs
-    checks:
-      - check: fingerprint
-        script: node tools/pnpm-deps/cli.mjs fingerprint
-        hash: stdout
+      - file: .moon-deps.json
+        optional: false
+
+  typecheck:
+    command: tsc --noEmit
+    inputs:
+      - apps/**/*.ts
+      - packages/**/*.ts
+      - tsconfig.json
+      - apps/**/tsconfig.json
+      - packages/**/tsconfig.json
+      - apps/**/package.json
+      - packages/**/package.json
+      - file: .moon-deps.json
+        optional: false
+      - file: apps/dashboard/.moon-deps.json
+        optional: false
+      - file: apps/palette/.moon-deps.json
+        optional: false
+      - file: packages/numbers/.moon-deps.json
+        optional: false
+      - file: packages/legacy-numbers/.moon-deps.json
+        optional: false
+      - file: packages/reports/.moon-deps.json
+        optional: false
+      - file: packages/colors/.moon-deps.json
+        optional: false
+
+  deps-update:
+    command: node tools/pnpm-deps/inputs.mjs update
+    options:
+      cache: false
+      runInCI: false
+
+  deps-check:
+    command: node tools/pnpm-deps/inputs.mjs check
+    inputs:
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - "**/.moon-deps.json"
+      - "**/package.json"
+      - tools/pnpm-deps/**/*.mjs
+    options:
+      cache: false
+      runInCI: always
+
+  verify-deps:
+    command: node tools/pnpm-deps/verify.mjs --report .moon/cache/dependency-inputs-e2e.json
+    options:
+      cache: false
+      runInCI: always

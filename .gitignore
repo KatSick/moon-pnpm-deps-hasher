@@ -1,6 +1,7 @@
 .DS_Store
 .sc/
 .moon/cache/
+.moon/hooks/
 node_modules/
 .pnpm-store/
 dist/

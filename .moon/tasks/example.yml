@@ -1,6 +1,10 @@
 inheritedBy:
   tags: [example]
 
+implicitInputs:
+  - file: .moon-deps.json
+    optional: false
+
 fileGroups:
   project:
     - src/**/*
@@ -18,10 +22,6 @@ tasks:
       - "@group(project)"
     outputs:
       - dist
-    checks:
-      - check: fingerprint
-        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
-        hash: stdout
 
   test:
     command: vitest run
@@ -29,25 +29,13 @@ tasks:
       - ^:build
     inputs:
       - "@group(project)"
-    checks:
-      - check: fingerprint
-        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
-        hash: stdout
 
   lint:
     command: oxlint --deny-warnings --config "$workspaceRoot/.oxlintrc.json" .
     inputs:
       - "@group(project)"
-    checks:
-      - check: fingerprint
-        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
-        hash: stdout
 
   format-check:
     command: oxfmt --check --config "$workspaceRoot/.oxfmtrc.json" .
     inputs:
       - "@group(project)"
-    checks:
-      - check: fingerprint
-        script: node ../../tools/pnpm-deps/cli.mjs fingerprint
-        hash: stdout
