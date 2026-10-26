@@ -133,6 +133,14 @@ Actions use immutable commit pins with release comments. The setup action caches
 
 The native CI report is `.moon/cache/ciReport.json`. E2E evidence is `.moon/cache/dependency-inputs-e2e.json`; both are uploaded as workflow artifacts after successful verification.
 
+### Solo-maintainer repository policy
+
+Changes to `main` require a pull request and the **Native moon CI** check from GitHub Actions to pass against an up-to-date branch. No review approvals are required, so the owner does not need a self-review. These protections apply to administrators too: no admin bypass, force pushes, or branch deletion. Conversations must be resolved, history must be linear, and squash merging is the only enabled merge method.
+
+Actions use a read-only default token and cannot approve pull requests. Repository policy requires full commit-SHA action pins and allows only GitHub-owned actions plus `moonrepo/setup-toolchain`. Workflow runs from all external fork contributors require maintainer approval; public forks and external pull requests remain possible.
+
+New runs cancel stale runs for the same workflow and pull request or ref. The CI job has a 15-minute timeout.
+
 ## End-to-end verification
 
 ```sh
